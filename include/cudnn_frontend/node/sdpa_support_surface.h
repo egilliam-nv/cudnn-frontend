@@ -877,9 +877,13 @@ SDPA_backward_attributes::validate_sdpa_backward_support_surface(const detail::C
                                     error_code_t::GRAPH_NOT_SUPPORTED,
                                     "Deterministic algorithm is not supported for bprop thd on SM8X and SM12X GPUs");
 
-        RETURN_CUDNN_FRONTEND_ERROR_IF(is_ragged && (8 == prop_major || 12 == prop_major) && inputs.at(input_names::Stats)->get_ragged_offset(),
-                                    error_code_t::GRAPH_NOT_SUPPORTED,
-                                    "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
+        // The composite (legacy) SM8X/SM12X kernels need a dense Stats tensor for THD; the unified backward
+        // engine requires the packed one, so this rule only applies when the composite path is selected.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(implementation != AttentionImplementation_t::UNIFIED && is_ragged &&
+                                           (8 == prop_major || 12 == prop_major) &&
+                                           inputs.at(input_names::Stats)->get_ragged_offset(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "Packed/ragged LSE is not supported for bprop thd on SM8X and SM12X GPUs");
     }
 
     // Non-ragged layouts other than BHSD are not correctly supported prior to 9.26.0.
@@ -1016,7 +1020,8 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             // from the dev line that follows 9.28.0 (the SM80/SM90 generic emitters are wired in a later MR).
             // TODO(nvbugs/5102117): bump the floor to the release these land in.
             int32_t const unified_sm_major = context.get_sm_version() / 10;
-            bool const unified_layouts_ok  = effective_cudnn_ver >= 92800 && unified_sm_major == 10;
+            bool const unified_layouts_ok  = effective_cudnn_ver >= 92800 &&
+                                            (unified_sm_major == 10 || unified_sm_major == 9 || unified_sm_major == 8);
             std::unordered_set<SDPA_backward_attributes::input_names> allowed_input_names{input_names::Q,
                                                                                           input_names::K,
                                                                                           input_names::V,
@@ -1024,26 +1029,34 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                                                                                           input_names::dO,
                                                                                           input_names::Stats,
                                                                                           input_names::Attn_scale};
+            // Attention sink (and its gradient) share the same dev-line floor as the layouts above.
+            bool const unified_sink_ok = effective_cudnn_ver >= 92800;
             if (unified_layouts_ok) {
                 allowed_input_names.insert(input_names::SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::SEQ_LEN_KV);
                 allowed_input_names.insert(input_names::CU_SEQ_LEN_Q);
                 allowed_input_names.insert(input_names::CU_SEQ_LEN_KV);
             }
+            if (unified_sink_ok) {
+                allowed_input_names.insert(input_names::SINK_TOKEN);
+            }
             for (const auto& [key, value] : inputs) {
                 if (allowed_input_names.find(key) == allowed_input_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
                             "Unified SDPA backward node doesn't yet support inputs other than Q, K, V, O, dO, Stats, "
-                            "Attn_scale (and the sequence lengths on SM100/SM107)"};
+                            "Attn_scale, the sequence lengths and the sink token"};
                 }
             }
 
-            std::unordered_set<SDPA_backward_attributes::output_names> const allowed_output_names{
+            std::unordered_set<SDPA_backward_attributes::output_names> allowed_output_names{
                 output_names::dQ, output_names::dK, output_names::dV};
+            if (unified_sink_ok) {
+                allowed_output_names.insert(output_names::DSINK_TOKEN);
+            }
             for (const auto& [key, value] : outputs) {
                 if (allowed_output_names.find(key) == allowed_output_names.end() && value != nullptr) {
                     return {error_code_t::GRAPH_NOT_SUPPORTED,
-                            "Unified SDPA backward node doesn't yet support outputs other than dQ, dK, dV"};
+                            "Unified SDPA backward node doesn't yet support outputs other than dQ, dK, dV, dSink"};
                 }
             }
 
